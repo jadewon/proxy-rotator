@@ -26,7 +26,7 @@ docker build -f deploy/Dockerfile -t proxy-rotator:dev .
 
 1. Fork the repo and create a topic branch off `main`.
 2. Keep changes focused — one logical change per PR.
-3. Ensure `go build ./...`, `go test ./...`, and `go vet ./...` all pass. CI will run these.
+3. Ensure `go build ./...`, `go test ./...`, and `go vet ./...` all pass locally.
 4. Update `README.md` / `PRD.md` when you change behavior, env vars, or architecture.
 5. Add an entry under `Unreleased` in `CHANGELOG.md`.
 

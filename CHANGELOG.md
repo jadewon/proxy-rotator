@@ -47,4 +47,4 @@ Initial public release.
 - CONNECT tunnels carry an idle deadline (`TOTAL_TIMEOUT`) to prevent zombie tunnels.
 - Validator supports `VERIFY_MATCH_BODY` for content-based validation; a warning is logged when `TEST_URL` is the example.com placeholder.
 - Proxy-Authorization header is stripped before forwarding upstream.
-- CI/Release workflows use least-privilege `contents: read` by default; release job scopes `contents: write` narrowly.
+- Release is performed locally via `docker buildx ... --push`; no GitHub Actions automation ships with the initial release.
