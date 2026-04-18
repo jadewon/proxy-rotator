@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
-	"strings"
 )
 
 // Checker validates Proxy-Authorization headers. When Enabled is false,
@@ -45,7 +44,7 @@ func (c *Checker) Authorize(w http.ResponseWriter, r *http.Request) bool {
 
 func constEqual(a, b string) bool {
 	if len(a) != len(b) {
-		return subtle.ConstantTimeCompare([]byte(a), []byte(strings.Repeat("\x00", len(a)))) == -1
+		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

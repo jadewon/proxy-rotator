@@ -124,7 +124,8 @@ kubectl apply -f deploy/examples/istio.yaml    # ServiceEntry + VirtualService
 공개 오픈 릴레이로 악용되지 않도록 다음 기본값을 적용한다:
 
 - **`LISTEN_ADDR=127.0.0.1`** — 사이드카로 붙을 때 앱 컨테이너만 접근. 다른 파드에서 접근하려면 `LISTEN_ADDR=0.0.0.0`으로 열되 **반드시 `PROXY_USERNAME/PASSWORD`를 함께 설정해야 부팅됨** (인증 없이 비-loopback 바인드는 거부).
-- **SSRF 가드** — 프록시 경유 요청의 타겟이 RFC1918, 루프백, 링크로컬, CGN, `169.254.169.254` (AWS/GCP metadata) 등으로 해석되면 403. 내부망 전용 환경에서 `ALLOW_PRIVATE_TARGETS=true`로 해제 가능.
+- **SSRF 가드** — 프록시 경유·직접 두 경로 모두에서, 타겟이 RFC1918, 루프백, 링크로컬, CGN, `169.254.169.254` (AWS/GCP metadata), `fd00:ec2::254` (AWS Nitro IPv6) 등으로 해석되면 403. `BYPASS_HOSTS` 매치도 가드를 거치므로, `.cluster.local`·`.svc` 같은 내부 대상을 허용하려면 **`ALLOW_PRIVATE_TARGETS=true`** 를 함께 설정해야 한다.
+- **DNS rebinding 방지** — 직접 경로에서는 가드가 리졸브한 IP로 직접 다이얼. 가드 시점과 연결 시점 사이의 DNS 변경으로 우회되지 않는다.
 - **HTTP 서버 타임아웃** — `ReadHeaderTimeout`, `IdleTimeout`, `MaxHeaderBytes`, `MaxBytesReader`로 slow/oversized 요청 차단.
 - **프록시 인증 헤더는 업스트림에 전달되지 않음** (검증 후 strip).
 - `deploy/examples/networkpolicy.yaml` — 보수적 ingress/egress NetworkPolicy 예시.

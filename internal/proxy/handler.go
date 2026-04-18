@@ -52,6 +52,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	target := targetHost(r)
 	start := time.Now()
+
 	switch h.router.Decide(target) {
 	case router.ActionReject:
 		http.Error(w, "rejected by router policy", http.StatusForbidden)
@@ -59,12 +60,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestDuration.WithLabelValues("rejected").Observe(time.Since(start).Seconds())
 		return
 	case router.ActionDirect:
-		h.serveDirect(w, r, target)
+		// Guard also runs for direct bypass targets so that the default
+		// BYPASS_HOSTS (.cluster.local, .svc) still cannot be reached unless
+		// the operator explicitly sets ALLOW_PRIVATE_TARGETS=true.
+		ip, err := h.guard.Resolve(r.Context(), target)
+		if err != nil {
+			h.log.Warn("guard blocked direct target", "host", target, "err", err)
+			http.Error(w, "target blocked", http.StatusForbidden)
+			metrics.RequestTotal.WithLabelValues("rejected").Inc()
+			metrics.RequestDuration.WithLabelValues("rejected").Observe(time.Since(start).Seconds())
+			return
+		}
+		h.serveDirect(w, r, target, ip)
 		metrics.RequestTotal.WithLabelValues("direct").Inc()
 		metrics.RequestDuration.WithLabelValues("direct").Observe(time.Since(start).Seconds())
 		return
 	}
 
+	// ActionProxy: guard is advisory here because actual DNS resolution
+	// happens at the SOCKS5 upstream, but we still want a declarative
+	// policy filter on the hostname.
 	if err := h.guard.CheckHost(r.Context(), target); err != nil {
 		h.log.Warn("guard blocked target", "host", target, "err", err)
 		http.Error(w, "target blocked", http.StatusForbidden)
@@ -93,9 +108,15 @@ func targetHost(r *http.Request) string {
 	return r.Host
 }
 
-func (h *Handler) serveDirect(w http.ResponseWriter, r *http.Request, target string) {
+func (h *Handler) serveDirect(w http.ResponseWriter, r *http.Request, target string, ip net.IP) {
+	port := portFromHostPort(target, defaultPortForScheme(r))
+	dialAddr := net.JoinHostPort(ip.String(), port)
+
 	if r.Method == http.MethodConnect {
-		upstream, err := net.DialTimeout("tcp", target, h.cfg.PerProxyTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.PerProxyTimeout)
+		defer cancel()
+		var dialer net.Dialer
+		upstream, err := dialer.DialContext(ctx, "tcp", dialAddr)
 		if err != nil {
 			h.log.Debug("direct dial failed", "target", target, "err", err)
 			http.Error(w, "direct dial failed", http.StatusBadGateway)
@@ -104,12 +125,38 @@ func (h *Handler) serveDirect(w http.ResponseWriter, r *http.Request, target str
 		hijackAndPipe(w, upstream, h.cfg.TotalTimeout)
 		return
 	}
+
+	// Pre-resolve: DialContext always connects to ip, regardless of addr,
+	// so DNS rebinding between guard.Resolve and the actual dial is impossible.
+	// TLS validation still uses the original hostname via ServerName inference
+	// from the URL.
 	tr := &http.Transport{
-		Proxy:               nil,
-		TLSHandshakeTimeout: h.cfg.PerProxyTimeout,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: h.cfg.PerProxyTimeout}
+			return d.DialContext(ctx, network, dialAddr)
+		},
+		TLSHandshakeTimeout:   h.cfg.PerProxyTimeout,
+		ResponseHeaderTimeout: h.cfg.PerProxyTimeout,
 	}
 	defer tr.CloseIdleConnections()
-	forward(w, r, tr, h.log)
+
+	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.TotalTimeout)
+	defer cancel()
+	forward(ctx, w, r, tr, h.log)
+}
+
+func defaultPortForScheme(r *http.Request) string {
+	if r.URL != nil && r.URL.Scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+func portFromHostPort(hostport, def string) string {
+	if _, port, err := net.SplitHostPort(hostport); err == nil && port != "" {
+		return port
+	}
+	return def
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, overallStart time.Time) {
@@ -146,8 +193,6 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, overallS
 		h.pool.RecordSuccess(entry.Addr, time.Since(dialStart))
 		metrics.UpstreamTotal.WithLabelValues("success").Inc()
 
-		// Tunnel holds the entry until the peer closes. Ensure Inflight is
-		// decremented even if hijackAndPipe panics.
 		defer release()
 		hijackAndPipe(w, upstream, h.cfg.TotalTimeout)
 		metrics.RequestTotal.WithLabelValues("success").Inc()
@@ -168,7 +213,6 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request, overallStar
 	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.TotalTimeout)
 	defer cancel()
 
-	// A request is retry-safe when it is idempotent AND has no body to replay.
 	retrySafe := idempotent(r.Method) && (r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0)
 	maxAttempts := 1
 	if retrySafe {
@@ -290,6 +334,8 @@ func idempotent(method string) bool {
 
 // hijackAndPipe bridges a CONNECT tunnel between client and upstream.
 // idleTimeout applies SetDeadline so zombie tunnels do not linger forever.
+// Note: this is an absolute deadline (not sliding), so long-lived healthy
+// tunnels still get cut at TOTAL_TIMEOUT.
 func hijackAndPipe(w http.ResponseWriter, upstream net.Conn, idleTimeout time.Duration) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -309,8 +355,9 @@ func hijackAndPipe(w http.ResponseWriter, upstream net.Conn, idleTimeout time.Du
 		return
 	}
 	if idleTimeout > 0 {
-		_ = client.SetDeadline(time.Now().Add(idleTimeout))
-		_ = upstream.SetDeadline(time.Now().Add(idleTimeout))
+		deadline := time.Now().Add(idleTimeout)
+		_ = client.SetDeadline(deadline)
+		_ = upstream.SetDeadline(deadline)
 	}
 
 	done := make(chan struct{}, 2)
@@ -319,8 +366,8 @@ func hijackAndPipe(w http.ResponseWriter, upstream net.Conn, idleTimeout time.Du
 	<-done
 }
 
-func forward(w http.ResponseWriter, r *http.Request, tr *http.Transport, log *slog.Logger) {
-	outReq := r.Clone(r.Context())
+func forward(ctx context.Context, w http.ResponseWriter, r *http.Request, tr *http.Transport, log *slog.Logger) {
+	outReq := r.Clone(ctx)
 	outReq.RequestURI = ""
 	removeHopHeaders(outReq.Header)
 	resp, err := tr.RoundTrip(outReq)

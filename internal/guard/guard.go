@@ -19,37 +19,44 @@ type Config struct {
 	AllowPrivate bool
 }
 
-// CheckHost resolves host and rejects targets in private, loopback,
-// link-local, or known-metadata ranges.
-func (c Config) CheckHost(ctx context.Context, host string) error {
-	if c.AllowPrivate {
-		return nil
-	}
-	// host may be "example.com" or "example.com:443" — strip the port.
+// Resolve resolves host to a single IP after rejecting blocked ranges.
+// Callers should dial this IP directly (not the hostname) to avoid DNS
+// rebinding between check and connect. When AllowPrivate is true the
+// block list is bypassed entirely.
+func (c Config) Resolve(ctx context.Context, host string) (net.IP, error) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	host = strings.Trim(host, "[]")
 	if ip := net.ParseIP(host); ip != nil {
-		if isBlocked(ip) {
-			return fmt.Errorf("%w: %s", ErrBlocked, ip)
+		if !c.AllowPrivate && isBlocked(ip) {
+			return nil, fmt.Errorf("%w: %s", ErrBlocked, ip)
 		}
-		return nil
+		return ip, nil
 	}
-	resolver := net.DefaultResolver
-	ips, err := resolver.LookupIP(ctx, "ip", host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", host, err)
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("%w: %s has no addresses", ErrBlocked, host)
+		return nil, fmt.Errorf("%w: %s has no addresses", ErrBlocked, host)
 	}
-	for _, ip := range ips {
-		if isBlocked(ip) {
-			return fmt.Errorf("%w: %s -> %s", ErrBlocked, host, ip)
+	if !c.AllowPrivate {
+		for _, ip := range ips {
+			if isBlocked(ip) {
+				return nil, fmt.Errorf("%w: %s -> %s", ErrBlocked, host, ip)
+			}
 		}
 	}
-	return nil
+	return ips[0], nil
+}
+
+// CheckHost runs Resolve and discards the IP. Kept for callers that only
+// need the policy decision (e.g. the SOCKS5 path where remote resolution
+// happens at the upstream proxy).
+func (c Config) CheckHost(ctx context.Context, host string) error {
+	_, err := c.Resolve(ctx, host)
+	return err
 }
 
 func isBlocked(ip net.IP) bool {
@@ -57,13 +64,22 @@ func isBlocked(ip net.IP) bool {
 		ip.IsMulticast() || ip.IsUnspecified() || ip.IsPrivate() {
 		return true
 	}
-	// Carrier-grade NAT (RFC 6598).
 	if ip4 := ip.To4(); ip4 != nil {
+		// Carrier-grade NAT (RFC 6598).
 		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 			return true
 		}
-		// Cloud metadata endpoints explicitly.
+		// Cloud metadata endpoints explicitly (IPv4).
 		if ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+		return false
+	}
+	// Explicit AWS Nitro IPv6 metadata endpoint: fd00:ec2::254.
+	// (IsPrivate already covers fd00::/8 ULA, but keep an explicit guard
+	// in case a future Go release narrows IsPrivate semantics.)
+	if ip16 := ip.To16(); ip16 != nil {
+		if ip16[0] == 0xfd && ip16[1] == 0x00 && ip16[2] == 0xec && ip16[3] == 0x02 {
 			return true
 		}
 	}

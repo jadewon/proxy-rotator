@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Guard also runs on the `ActionDirect` path, so `BYPASS_HOSTS` entries in
+  private ranges are blocked unless `ALLOW_PRIVATE_TARGETS=true` is set.
+- Direct path pre-resolves the target via the guard and dials the IP,
+  closing the DNS-rebinding TOCTOU between guard check and dial.
+- `forward()` now honours `TOTAL_TIMEOUT` via `context.WithTimeout`.
+- Explicit block for AWS Nitro IPv6 metadata (`fd00:ec2::254`) in addition
+  to the generic ULA check.
+
+### Fixed
+- Removed dead `-1` branch in `auth.constEqual` (returns false on length
+  mismatch).
+- Replaced hand-rolled `containsString` with `bytes.Contains` in the
+  validator's body-match path.
+
 ## [0.1.0] - TBD
 
 Initial public release.

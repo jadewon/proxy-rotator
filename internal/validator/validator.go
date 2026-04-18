@@ -3,6 +3,7 @@
 package validator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -81,38 +82,8 @@ func (v *HTTP) Validate(ctx context.Context, raw RawProxy) error {
 	if err != nil {
 		return fmt.Errorf("body read: %w", err)
 	}
-	if !containsString(body, v.MatchBody) {
+	if !bytes.Contains(body, []byte(v.MatchBody)) {
 		return fmt.Errorf("body match failed")
 	}
 	return nil
-}
-
-func containsString(haystack []byte, needle string) bool {
-	if needle == "" {
-		return true
-	}
-	if len(haystack) < len(needle) {
-		return false
-	}
-	// net/http guarantees body is raw bytes; simple substring check.
-	// Avoid importing "strings" on a hot-ish path by doing it manually.
-	n := []byte(needle)
-	for i := 0; i+len(n) <= len(haystack); i++ {
-		if haystack[i] == n[0] && bytesEq(haystack[i:i+len(n)], n) {
-			return true
-		}
-	}
-	return false
-}
-
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
