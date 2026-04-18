@@ -1,0 +1,26 @@
+# Istio example (optional): transparent routing without app changes.
+# Requires the Service from deployment.yaml.
+
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: target-external
+spec:
+  hosts: ["target-site.com"]
+  ports:
+    - {number: 443, name: https, protocol: TLS}
+  resolution: DNS
+  location: MESH_EXTERNAL
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: target-via-rotator
+spec:
+  hosts: ["target-site.com"]
+  http:
+    - route:
+        - destination:
+            host: proxy-rotator.default.svc.cluster.local
+            port:
+              number: 3128

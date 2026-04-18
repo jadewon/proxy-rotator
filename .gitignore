@@ -1,0 +1,18 @@
+# Build artifacts
+/proxy-rotator
+/bin/
+/dist/
+*.exe
+
+# Local test files
+/tmp/
+proxies.local.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Go
+vendor/

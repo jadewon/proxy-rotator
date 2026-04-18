@@ -1,0 +1,24 @@
+# Sidecar snippet: merge into your Deployment's spec.template.spec.containers list.
+
+- name: proxy-rotator
+  image: jadewon/proxy-rotator:latest
+  ports:
+    - {name: proxy, containerPort: 3128}
+    - {name: admin, containerPort: 8080}
+  env:
+    - {name: TEST_URL, value: "https://example.com"}       # use your real target URL
+    - {name: SOURCES, value: "freeproxy"}
+    - {name: MATCH_HOSTS, value: "target-site.com"}        # only these hosts go through SOCKS5
+    - {name: DEFAULT_ACTION, value: "direct"}
+    # With HTTP_PROXY=http://localhost:3128 on the app container, proxy-rotator
+    # sends MATCH_HOSTS via SOCKS5 and forwards the rest directly.
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits:   {cpu: 200m, memory: 128Mi}
+  livenessProbe:
+    httpGet: {path: /healthz, port: admin}
+    initialDelaySeconds: 30
+    periodSeconds: 30
+  readinessProbe:
+    httpGet: {path: /healthz, port: admin}
+    periodSeconds: 5
