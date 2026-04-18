@@ -283,19 +283,32 @@ docker build -f deploy/Dockerfile -t proxy-rotator .
 
 ---
 
-## 릴리스 (로컬 빌드·푸시)
+## 릴리스
+
+### 자동 (권장)
+
+`v*` 태그를 푸시하면 GitHub Actions가 multi-arch(amd64+arm64) 이미지를 빌드해
+Docker Hub (`jadewon/proxy-rotator`)에 push하고 GitHub Release를 생성한다.
 
 ```bash
-docker login
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+필요한 GitHub Secrets:
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN` (Docker Hub Access Token)
+
+### 로컬 (CI 우회)
+
+```bash
+docker login -u <username>
 VERSION=0.1.0
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f deploy/Dockerfile \
   -t jadewon/proxy-rotator:$VERSION \
   -t jadewon/proxy-rotator:latest \
   --push .
-
-git tag v$VERSION
-git push origin v$VERSION
 ```
 
 ---
