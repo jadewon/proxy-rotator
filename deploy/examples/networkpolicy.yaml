@@ -1,0 +1,39 @@
+# Conservative NetworkPolicy for proxy-rotator.
+#
+# Ingress: only from pods that opt in with `proxy-rotator-client: "true"`.
+# Egress: DNS (53), HTTPS (443) for source fetch + target traffic, and 1080
+# for SOCKS5 backends. Tighten these to your environment as needed.
+#
+# Apply after deployment.yaml.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proxy-rotator
+spec:
+  podSelector:
+    matchLabels: {app: proxy-rotator}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              proxy-rotator-client: "true"
+      ports:
+        - {protocol: TCP, port: 3128}
+        - {protocol: TCP, port: 8080}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS for fetching proxy lists and for the target traffic itself.
+    - ports:
+        - {protocol: TCP, port: 443}
+    # Common SOCKS5 ports. Adjust for your source list's typical port range.
+    - ports:
+        - {protocol: TCP, port: 1080}
+        - {protocol: TCP, port: 4145}
+        - {protocol: TCP, port: 9050}

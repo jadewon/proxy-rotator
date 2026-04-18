@@ -1,8 +1,11 @@
+// Package validator probes SOCKS5 candidates by requesting a known URL
+// through each proxy and optionally checking the response body.
 package validator
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -22,12 +25,13 @@ type Validator interface {
 }
 
 type HTTP struct {
-	TestURL string
-	Timeout time.Duration
+	TestURL   string
+	Timeout   time.Duration
+	MatchBody string // if non-empty, response body must contain this string
 }
 
-func New(testURL string, timeout time.Duration) *HTTP {
-	return &HTTP{TestURL: testURL, Timeout: timeout}
+func New(testURL string, timeout time.Duration, matchBody string) *HTTP {
+	return &HTTP{TestURL: testURL, Timeout: timeout, MatchBody: matchBody}
 }
 
 func (v *HTTP) Validate(ctx context.Context, raw RawProxy) error {
@@ -68,5 +72,47 @@ func (v *HTTP) Validate(ctx context.Context, raw RawProxy) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
+	if v.MatchBody == "" {
+		return nil
+	}
+	// Cap body read to guard against hostile upstreams feeding infinite bodies.
+	const bodyCap = 256 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, bodyCap))
+	if err != nil {
+		return fmt.Errorf("body read: %w", err)
+	}
+	if !containsString(body, v.MatchBody) {
+		return fmt.Errorf("body match failed")
+	}
 	return nil
+}
+
+func containsString(haystack []byte, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if len(haystack) < len(needle) {
+		return false
+	}
+	// net/http guarantees body is raw bytes; simple substring check.
+	// Avoid importing "strings" on a hot-ish path by doing it manually.
+	n := []byte(needle)
+	for i := 0; i+len(n) <= len(haystack); i++ {
+		if haystack[i] == n[0] && bytesEq(haystack[i:i+len(n)], n) {
+			return true
+		}
+	}
+	return false
+}
+
+func bytesEq(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

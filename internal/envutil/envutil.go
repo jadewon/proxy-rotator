@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +28,21 @@ func Int(key string, def int) int {
 	return n
 }
 
+func Bool(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off", "":
+		return false
+	}
+	slog.Warn("invalid bool env", "key", key, "value", v, "default", def)
+	return def
+}
+
 func Duration(key string, def time.Duration) time.Duration {
 	v, ok := os.LookupEnv(key)
 	if !ok {
@@ -46,29 +62,11 @@ func StringSlice(key, def string) []string {
 		return nil
 	}
 	parts := []string{}
-	start := 0
-	for i := 0; i < len(raw); i++ {
-		if raw[i] == ',' {
-			s := trim(raw[start:i])
-			if s != "" {
-				parts = append(parts, s)
-			}
-			start = i + 1
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			parts = append(parts, s)
 		}
 	}
-	s := trim(raw[start:])
-	if s != "" {
-		parts = append(parts, s)
-	}
 	return parts
-}
-
-func trim(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

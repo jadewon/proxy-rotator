@@ -90,47 +90,21 @@ func (p *Pool) promoteExpiredQuarantine() {
 	}
 }
 
-func (p *Pool) Select() (*Entry, error) {
+// Select picks one active entry via Power-of-Two-Choices. Entries in
+// exclude (keyed by Addr) are skipped; pass nil to select from all active.
+// The returned entry has Inflight incremented; callers must DecInflight.
+func (p *Pool) Select(exclude map[string]bool) (*Entry, error) {
 	p.mu.Lock()
 	p.promoteExpiredQuarantine()
 	active := make([]*Entry, 0, len(p.entries))
 	for _, e := range p.entries {
-		if e.State == StateActive {
-			active = append(active, e)
+		if e.State != StateActive {
+			continue
 		}
-	}
-	p.mu.Unlock()
-
-	if len(active) == 0 {
-		return nil, ErrEmpty
-	}
-	if len(active) == 1 {
-		active[0].IncInflight()
-		return active[0], nil
-	}
-
-	a := rand.IntN(len(active))
-	b := rand.IntN(len(active) - 1)
-	if b >= a {
-		b++
-	}
-	ea, eb := active[a], active[b]
-	chosen := ea
-	if eb.Inflight() < ea.Inflight() {
-		chosen = eb
-	}
-	chosen.IncInflight()
-	return chosen, nil
-}
-
-func (p *Pool) SelectExcept(exclude map[string]bool) (*Entry, error) {
-	p.mu.Lock()
-	p.promoteExpiredQuarantine()
-	active := make([]*Entry, 0, len(p.entries))
-	for _, e := range p.entries {
-		if e.State == StateActive && !exclude[e.Addr] {
-			active = append(active, e)
+		if exclude[e.Addr] {
+			continue
 		}
+		active = append(active, e)
 	}
 	p.mu.Unlock()
 

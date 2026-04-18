@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jadewon/proxy-rotator/internal/auth"
 	"github.com/jadewon/proxy-rotator/internal/envutil"
+	"github.com/jadewon/proxy-rotator/internal/guard"
 	"github.com/jadewon/proxy-rotator/internal/metrics"
 	"github.com/jadewon/proxy-rotator/internal/pool"
 	proxysrv "github.com/jadewon/proxy-rotator/internal/proxy"
@@ -24,13 +28,29 @@ import (
 	_ "github.com/jadewon/proxy-rotator/internal/sources/freeproxy"
 )
 
+const defaultTestURL = "https://example.com"
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: parseLogLevel(envutil.String("LOG_LEVEL", "info")),
 	})))
 
+	listenAddr := envutil.String("LISTEN_ADDR", "127.0.0.1")
 	listenPort := envutil.Int("LISTEN_PORT", 3128)
+	adminAddr := envutil.String("ADMIN_ADDR", "0.0.0.0")
 	adminPort := envutil.Int("ADMIN_PORT", 8080)
+
+	authChecker := auth.New(
+		envutil.String("PROXY_USERNAME", ""),
+		envutil.String("PROXY_PASSWORD", ""),
+	)
+	if !authChecker.Enabled && !isLoopback(listenAddr) {
+		slog.Error("refusing to bind non-loopback proxy port without PROXY_USERNAME/PROXY_PASSWORD",
+			"listen_addr", listenAddr, "hint", "set credentials or LISTEN_ADDR=127.0.0.1")
+		os.Exit(2)
+	}
+
+	guardCfg := guard.Config{AllowPrivate: envutil.Bool("ALLOW_PRIVATE_TARGETS", false)}
 
 	poolCfg := pool.DefaultConfig()
 	poolCfg.Max = envutil.Int("POOL_MAX", poolCfg.Max)
@@ -39,9 +59,14 @@ func main() {
 
 	p := pool.New(poolCfg)
 
-	testURL := envutil.String("TEST_URL", "https://example.com")
+	testURL := envutil.String("TEST_URL", defaultTestURL)
+	if testURL == defaultTestURL {
+		slog.Warn("TEST_URL is the default placeholder; set it to your real target URL for meaningful validation",
+			"test_url", testURL)
+	}
 	testTimeout := envutil.Duration("TEST_TIMEOUT", 8*time.Second)
-	v := validator.New(testURL, testTimeout)
+	matchBody := envutil.String("VERIFY_MATCH_BODY", "")
+	v := validator.New(testURL, testTimeout, matchBody)
 
 	rt := router.New(
 		envutil.StringSlice("MATCH_HOSTS", ""),
@@ -54,7 +79,10 @@ func main() {
 		PerProxyTimeout: envutil.Duration("PER_PROXY_TIMEOUT", 8*time.Second),
 		TotalTimeout:    envutil.Duration("TOTAL_TIMEOUT", 30*time.Second),
 	}
-	h := proxysrv.New(p, rt, handlerCfg)
+	h := proxysrv.New(p, rt, authChecker, guardCfg, handlerCfg)
+
+	maxRequestBody := int64(envutil.Int("MAX_REQUEST_BODY", 10*1024*1024))
+	proxyHandler := withBodyLimit(h, maxRequestBody)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -78,24 +106,34 @@ func main() {
 
 	go poolMetricsLoop(ctx, p)
 
+	readHeaderTimeout := envutil.Duration("READ_HEADER_TIMEOUT", 5*time.Second)
+	idleTimeout := envutil.Duration("IDLE_TIMEOUT", 120*time.Second)
+	maxHeaderBytes := envutil.Int("MAX_HEADER_BYTES", 1<<20) // 1 MiB
+
 	adminSrv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", adminPort),
-		Handler: adminMux(p),
+		Addr:              fmt.Sprintf("%s:%d", adminAddr, adminPort),
+		Handler:           adminMux(p),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 	proxySrv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", listenPort),
-		Handler: h,
+		Addr:              fmt.Sprintf("%s:%d", listenAddr, listenPort),
+		Handler:           proxyHandler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
 	go func() {
-		slog.Info("admin listening", "port", adminPort)
-		if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Info("admin listening", "addr", adminSrv.Addr)
+		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("admin server", "err", err)
 		}
 	}()
 	go func() {
-		slog.Info("proxy listening", "port", listenPort)
-		if err := proxySrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Info("proxy listening", "addr", proxySrv.Addr, "auth", authChecker.Enabled)
+		if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("proxy server", "err", err)
 		}
 	}()
@@ -108,6 +146,25 @@ func main() {
 	_ = proxySrv.Shutdown(shutCtx)
 	_ = adminSrv.Shutdown(shutCtx)
 	wg.Wait()
+}
+
+// withBodyLimit wraps a handler to cap request body size. CONNECT tunnels
+// bypass this since body semantics do not apply.
+func withBodyLimit(next http.Handler, n int64) http.Handler {
+	if n <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, n)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopback(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	return addr == "127.0.0.1" || addr == "::1" || addr == "localhost"
 }
 
 func adminMux(p *pool.Pool) http.Handler {
@@ -141,18 +198,13 @@ func poolMetricsLoop(ctx context.Context, p *pool.Pool) {
 		metrics.PoolSize.WithLabelValues("active").Set(float64(active))
 		metrics.PoolSize.WithLabelValues("quarantine").Set(float64(quarantine))
 
-		bySource := map[string]float64{}
+		// Reset first so sources that disappeared fall to zero and then
+		// drop out of the registry, instead of stuck at the last value.
+		metrics.PoolBySource.Reset()
 		for _, s := range p.Snapshot() {
 			if s.State == "active" {
-				bySource[s.Source]++
-			} else {
-				if _, ok := bySource[s.Source]; !ok {
-					bySource[s.Source] = 0
-				}
+				metrics.PoolBySource.WithLabelValues(s.Source).Inc()
 			}
-		}
-		for src, n := range bySource {
-			metrics.PoolBySource.WithLabelValues(src).Set(n)
 		}
 	}
 }
