@@ -95,6 +95,7 @@ kubectl apply -f deploy/examples/istio.yaml    # ServiceEntry + VirtualService
 | `READ_HEADER_TIMEOUT` | `5s` | HTTP 서버 헤더 읽기 타임아웃 (slowloris 방지) |
 | `IDLE_TIMEOUT` | `120s` | HTTP keepalive idle 타임아웃 |
 | `MAX_HEADER_BYTES` | `1048576` | HTTP 헤더 최대 바이트 |
+| `STARTUP_GRACE` | `30s` | 이 시간 내 풀에 active 엔트리가 생기지 않아도 `/startupz`를 200으로 전환 |
 | `TEST_URL` | `https://example.com` | 검증용 GET 대상 (실제 타겟 URL **강권장**) |
 | `VERIFY_MATCH_BODY` | (비어있음) | 응답 본문에 이 문자열이 포함돼야 유효 |
 | `TEST_TIMEOUT` | `8s` | 검증 타임아웃 |
@@ -134,11 +135,16 @@ kubectl apply -f deploy/examples/istio.yaml    # ServiceEntry + VirtualService
 
 ## 엔드포인트
 
-| Path | 설명 |
-|------|------|
-| `GET /healthz` | 풀에 active 엔트리 ≥ 1이면 200, 아니면 503 |
-| `GET /pool` | 현재 풀 상태 JSON (디버그) |
-| `GET /metrics` | Prometheus 포맷 |
+| Path | 용도 | 응답 기준 |
+|------|------|-----------|
+| `GET /livez` | K8s **livenessProbe** | 프로세스가 살아있으면 항상 200. 풀 상태와 무관 (재시작 루프 방지) |
+| `GET /readyz` | K8s **readinessProbe** | 풀에 active 엔트리 ≥ 1이면 200, 아니면 503 |
+| `GET /startupz` | K8s **startupProbe** | 첫 프록시가 풀에 들어왔거나 `STARTUP_GRACE` 경과 시 200 |
+| `GET /healthz` | 과거 호환 (= `/readyz`) | |
+| `GET /pool` | 디버그 | 현재 풀 상태 JSON |
+| `GET /metrics` | Prometheus | |
+
+K8s 3-probe 예시는 [`deploy/examples/deployment.yaml`](./deploy/examples/deployment.yaml) 참조.
 
 주요 메트릭:
 

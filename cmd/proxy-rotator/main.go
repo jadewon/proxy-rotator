@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -106,13 +107,21 @@ func main() {
 
 	go poolMetricsLoop(ctx, p)
 
+	// Startup gate: becomes true once the pool first has an active entry OR
+	// the grace period elapses (whichever comes first). The grace fallback
+	// prevents the pod from restart-looping when upstream proxy sources are
+	// transiently unavailable at boot.
+	var startupDone atomic.Bool
+	startupGrace := envutil.Duration("STARTUP_GRACE", 30*time.Second)
+	go watchStartup(ctx, p, &startupDone, startupGrace)
+
 	readHeaderTimeout := envutil.Duration("READ_HEADER_TIMEOUT", 5*time.Second)
 	idleTimeout := envutil.Duration("IDLE_TIMEOUT", 120*time.Second)
 	maxHeaderBytes := envutil.Int("MAX_HEADER_BYTES", 1<<20) // 1 MiB
 
 	adminSrv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", adminAddr, adminPort),
-		Handler:           adminMux(p),
+		Handler:           adminMux(p, &startupDone),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
@@ -167,22 +176,72 @@ func isLoopback(addr string) bool {
 	return addr == "127.0.0.1" || addr == "::1" || addr == "localhost"
 }
 
-func adminMux(p *pool.Pool) http.Handler {
+func adminMux(p *pool.Pool, startupDone *atomic.Bool) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+
+	// livez: process is alive. Always 200 when the admin server responds.
+	// Use as livenessProbe so a temporarily empty pool does not trigger a
+	// restart loop.
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	// readyz: ready to serve proxied traffic (pool has at least one active
+	// entry). Use as readinessProbe so Services remove the pod from
+	// endpoints when the pool drains.
+	readyHandler := func(w http.ResponseWriter, r *http.Request) {
 		active, _ := p.Size()
 		if active < 1 {
 			http.Error(w, "pool empty", http.StatusServiceUnavailable)
 			return
 		}
 		fmt.Fprintf(w, "ok active=%d\n", active)
+	}
+	mux.HandleFunc("/readyz", readyHandler)
+	// healthz is kept as a backward-compatible alias for readyz.
+	mux.HandleFunc("/healthz", readyHandler)
+
+	// startupz: boot has completed. Returns 200 once either the pool has
+	// served its first active entry or STARTUP_GRACE elapses. Use as
+	// startupProbe to prevent slow source fetches from failing liveness.
+	mux.HandleFunc("/startupz", func(w http.ResponseWriter, r *http.Request) {
+		if startupDone.Load() {
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		http.Error(w, "starting", http.StatusServiceUnavailable)
 	})
+
 	mux.HandleFunc("/pool", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(p.Snapshot())
 	})
 	mux.Handle("/metrics", metrics.Handler())
 	return mux
+}
+
+func watchStartup(ctx context.Context, p *pool.Pool, done *atomic.Bool, grace time.Duration) {
+	deadline := time.After(grace)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			if done.CompareAndSwap(false, true) {
+				slog.Info("startup grace elapsed", "grace", grace)
+			}
+			return
+		case <-t.C:
+			if active, _ := p.Size(); active >= 1 {
+				if done.CompareAndSwap(false, true) {
+					slog.Info("startup complete", "active", active)
+				}
+				return
+			}
+		}
+	}
 }
 
 func poolMetricsLoop(ctx context.Context, p *pool.Pool) {

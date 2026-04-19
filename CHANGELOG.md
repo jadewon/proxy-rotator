@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Separate probe endpoints for the three Kubernetes probe kinds:
+  `/livez` (always 200 while process is up), `/readyz` (pool has an active
+  entry), `/startupz` (first proxy or `STARTUP_GRACE` elapsed). `/healthz`
+  remains as a backward-compatible alias for `/readyz`. Deployment/sidecar
+  examples now wire `startupProbe`, `livenessProbe`, `readinessProbe`
+  distinctly so a drained pool no longer triggers restart loops.
+
 ### Security
 - Guard also runs on the `ActionDirect` path, so `BYPASS_HOSTS` entries in
   private ranges are blocked unless `ALLOW_PRIVATE_TARGETS=true` is set.
