@@ -8,6 +8,15 @@
 /tmp/
 proxies.local.txt
 
+# Environment files (real credentials)
+.env
+.env.local
+.env.*.local
+
+# Internal-only documentation (operator-specific setup, credentials,
+# endpoint URLs, etc.). Never committed to a public repository.
+docs/internal/
+
 # IDE
 .vscode/
 .idea/

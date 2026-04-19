@@ -371,6 +371,15 @@ proxy-rotator/
 - 무료 프록시 의존 시 가용성/품질 불안정 → 투명 재시도 + 실시간 피드백으로 완화하되 완전 해결은 불가
 - SOCKS5 공개 프록시는 인증 미지원이 일반적 (`Auth` 필드는 유료 소스 확장용)
 - 인스턴스별 독립 풀 전제 (여러 레플리카 간 공유 없음)
+- **443-only egress 환경에서는 proxy-rotator를 해당 네트워크 내부에서
+  실행할 수 없다** — SOCKS5 다이얼이 비표준 포트(1080/4145/9050 등)를
+  요구하므로, serving 컴포넌트는 반드시 egress 자유로운 환경에
+  배치해야 한다. 자세한 내용은 `docs/deployment/egress-restricted.md`
+- **`TEST_URL`은 실제 크롤링 타겟으로 지정하면 안 된다** — 매 사이클마다
+  모든 후보 프록시가 동시에 호출하여 타겟 입장에선 분산 공격 패턴으로
+  보이고, 오히려 차단을 강화시킨다. 중립적 엔드포인트
+  (`https://www.cloudflare.com/cdn-cgi/trace` 등) 사용. 실사용 성공/실패는
+  RequestTracker가 자동 반영한다.
 
 ## 미래 요구사항 (낮은 우선순위)
 
@@ -387,6 +396,11 @@ proxy-rotator/
 - 자체 소유 프록시 플러그인 (고정 고품질)
 - SOCKS5 인증 (username/password)
 - SOCKS4 / HTTP 프록시 백엔드 수용
+- **`SKIP_VALIDATION` 옵션** (소스 단위) — 외부에서 이미 검증된 풀을
+  pull만 하는 deployment(예: collector/server 분리)에서 중복 검증 생략
+- **`pool-mirror` 소스 플러그인** — 다른 proxy-rotator 인스턴스의 `/pool`
+  JSON을 mirror. 이 조합으로 "외부 검증 노드 + 내부 서빙 노드" 아키텍처
+  공식 지원
 
 ### 품질/제어
 - 응답 내용 검증 (CAPTCHA/차단 페이지 패턴 감지)

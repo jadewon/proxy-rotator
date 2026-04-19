@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- New `docs/` tree with deployment and reference guides:
+  - `docs/deployment/railway.md` — Railway-specific caveats (HTTPS domain
+    incompatible, TCP Proxy required)
+  - `docs/deployment/k8s-sidecar.md` — sidecar vs cluster-wide vs external
+    patterns
+  - `docs/deployment/egress-restricted.md` — architectural guidance for
+    443-only VPC egress (the serving component cannot run inside such a
+    pod; must be external)
+  - `docs/deployment/hosting-options.md` — comparison of hosts (Railway,
+    Fly.io, Oracle Cloud, Lightsail, etc.)
+  - `docs/references.md` — related open source proxy rotator projects
+- `.env.example` — template for all environment variables with inline
+  guidance on which are required.
+- README: added a strong warning against pointing `TEST_URL` at the
+  real crawl target, and linked the new deployment guides.
+- PRD: future requirements list extended with `SKIP_VALIDATION` source
+  option and `pool-mirror` source plugin for collector/server split
+  deployments. Constraints section documents the egress-restricted
+  limitation and the `TEST_URL` gotcha.
+
 ### Added
 - Separate probe endpoints for the three Kubernetes probe kinds:
   `/livez` (always 200 while process is up), `/readyz` (pool has an active
