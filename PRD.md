@@ -1,123 +1,137 @@
 # proxy-rotator PRD
 
-## 개요
+## Overview
 
-SOCKS5 프록시를 다중 소스에서 수집·검증하여 **중앙 풀**로 관리하고, HTTP 포워드 프록시로 제공하는 경량 게이트웨이.
-Docker 단독, K8s 사이드카, (옵션) Istio 메쉬 어느 환경에서도 동일한 Go 단일 바이너리로 동작한다.
-외부 사이트의 IP 차단 우회를 위해 서비스 코드 변경 없이 `HTTP_PROXY` 설정만으로 사용 가능하다.
+A lightweight gateway that collects and validates SOCKS5 proxies from
+multiple sources into a **central pool** and exposes them through a
+single HTTP forward proxy endpoint.
+One Go binary runs unchanged across Docker, Kubernetes sidecars, or
+Kubernetes behind an Istio mesh.
+Service code stays untouched — clients just set `HTTP_PROXY` to route
+through the rotating pool.
 
-## 배경
+## Background
 
-- 외부 사이트 크롤링 시 클라우드 사업자 IP 차단으로 데이터 수집 불가한 경우가 빈번
-- 서비스 코드에 SOCKS5 에이전트를 직접 의존시키면 런타임 호환성/복잡도 증가
-- 프록시 수집/검증 로직은 서비스와 분리하여 범용 게이트웨이로 재사용해야 함
+- External-site crawling frequently breaks because the target blocks
+  cloud-provider IP ranges
+- Pulling a SOCKS5 agent library directly into service code creates
+  runtime-compatibility and complexity issues
+- The collect/validate/rotate logic should be extracted from services
+  so it can be reused as a general-purpose gateway
 
-## 목표
+## Goals
 
-1. 서비스 코드에서 프록시 관련 의존성 완전 제거
-2. 프록시 소스를 **플러그인**으로 추가할 수 있는 구조
-3. **중앙 풀**을 단일 진실로 관리하고, 실시간 피드백으로 장애 프록시 자동 격리
-4. 어떤 런타임에서도 동작 (Docker 단독 / plain K8s / Istio 메쉬)
-5. 단일 Go 정적 바이너리, 추가 런타임 의존성 없음
+1. Remove any proxy-related dependency from service code
+2. Make proxy sources **pluggable** so new ones can be added without
+   touching the core
+3. Keep a **central pool** as the single source of truth and let a
+   real-time feedback loop quarantine failing proxies
+4. Run in any runtime (standalone Docker / plain Kubernetes / Istio)
+5. Ship as a single static Go binary with no runtime dependencies
 
-## 아키텍처
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  K8s Pod                                                     │
 │                                                              │
-│  [앱 컨테이너]                                                │
-│    │ HTTP_PROXY=localhost:3128                              │
-│    │ (Istio 사용 시 VirtualService로 투명 라우팅 대체 가능)   │
+│  [app container]                                             │
+│    │ HTTP_PROXY=localhost:3128                               │
+│    │ (or transparent routing via Istio VirtualService)       │
 │    ▼                                                         │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │  proxy-rotator (Go 단일 바이너리)                     │    │
+│  │  proxy-rotator (single Go binary)                    │    │
 │  │                                                      │    │
-│  │  :3128 HTTP Forward Proxy (CONNECT + HTTP)           │    │
+│  │  :3128 HTTP forward proxy (CONNECT + plain HTTP)     │    │
 │  │    │                                                 │    │
 │  │    ▼  select()                                       │    │
 │  │  ┌────────────────────────────────────────────────┐  │    │
-│  │  │ 중앙 Pool (sync.RWMutex, 단일 배열)             │  │    │
+│  │  │ Central Pool (sync.RWMutex, single array)      │  │    │
 │  │  │                                                │  │    │
 │  │  │  [{addr, source, ewmaLatency, successRate,     │  │    │
 │  │  │    consecFails, inflight, lastOk, metadata},   │  │    │
 │  │  │   ...]                                         │  │    │
 │  │  │                                                │  │    │
-│  │  │  Select:  Power-of-Two-Choices                 │  │    │
+│  │  │  Select:  power-of-two-choices                 │  │    │
 │  │  │  Eject:   consecFails ≥ 3 → quarantine         │  │    │
-│  │  │  Revive:  quarantine TTL 후 재검증              │  │    │
+│  │  │  Revive:  revalidate after quarantine TTL      │  │    │
 │  │  └────────────────────────────────────────────────┘  │    │
 │  │       ▲                         ▲                    │    │
 │  │       │ Add/Remove              │ per-request        │    │
 │  │       │                         │ feedback           │    │
 │  │  ┌────┴──────────────┐    ┌─────┴──────────────┐     │    │
-│  │  │ Source Plugins     │    │ RequestTracker     │     │    │
-│  │  │  (goroutine 각각)   │    │                    │     │    │
+│  │  │ Source plugins     │    │ RequestTracker     │     │    │
+│  │  │ (own goroutines)   │    │                    │     │    │
 │  │  │                    │    │ success → EWMA     │     │    │
 │  │  │  ┌──────────────┐  │    │ fail    → consec++ │     │    │
-│  │  │  │ FreeProxy    │  │    │ timeout → fail     │     │    │
+│  │  │  │ freeproxy    │  │    │ timeout → fail     │     │    │
 │  │  │  └──────────────┘  │    └────────────────────┘     │    │
 │  │  │  ┌──────────────┐  │                               │    │
-│  │  │  │ Geonode      │  │    ┌────────────────────┐     │    │
-│  │  │  └──────────────┘  │    │ Validator (공통)    │     │    │
-│  │  │  ┌──────────────┐  │◄───│ TEST_URL 요청 검증  │     │    │
-│  │  │  │ Static/File  │  │    └────────────────────┘     │    │
-│  │  │  └──────────────┘  │                               │    │
-│  │  │  ┌──────────────┐  │                               │    │
-│  │  │  │ (사용자 추가)  │  │                               │    │
-│  │  │  └──────────────┘  │                               │    │
+│  │  │  │ file         │  │    ┌────────────────────┐     │    │
+│  │  │  └──────────────┘  │    │ Validator (shared) │     │    │
+│  │  │  ┌──────────────┐  │◄───│ Check each candidate│    │    │
+│  │  │  │ (user-added) │  │    │ against TEST_URL   │     │    │
+│  │  │  └──────────────┘  │    └────────────────────┘     │    │
 │  │  └────────────────────┘                               │    │
 │  │                                                       │    │
-│  │  :8080  /healthz  /metrics  /pool (debug)             │    │
+│  │  :8080  /livez /readyz /startupz /pool /metrics       │    │
 │  └───────────────────────────────────────────────────────┘    │
 │                             │                                 │
 │                             ▼ SOCKS5                          │
-│                        외부 사이트                             │
+│                     external target site                      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## 구성 요소
+## Components
 
-### 1. HTTP 포워드 프록시
+### 1. HTTP forward proxy
 
-| 항목 | 내용 |
-|------|------|
-| 구현 | Go `net/http/httputil` 기반 CONNECT 터널 + HTTP forward |
-| 포트 | 3128 (localhost only) |
-| 업스트림 다이얼 | SOCKS5 (`golang.org/x/net/proxy`) |
-| 투명 재시도 | 멱등 메서드(GET/HEAD/OPTIONS) 한해 최대 `MAX_RETRIES`회, 다른 프록시로 |
-| 타임아웃 | `PER_PROXY_TIMEOUT` 단위, 재시도 포함 `TOTAL_TIMEOUT` 상한 |
+| Item | Details |
+|------|---------|
+| Implementation | Go `net/http/httputil` — CONNECT tunnel + plain HTTP forward |
+| Port | 3128 (loopback by default) |
+| Upstream dial | SOCKS5 via `golang.org/x/net/proxy` |
+| Transparent retry | Up to `MAX_RETRIES` on a different proxy, for idempotent methods only (GET/HEAD/OPTIONS) |
+| Timeouts | `PER_PROXY_TIMEOUT` per attempt, `TOTAL_TIMEOUT` including retries |
 
-### 2. 중앙 풀 (Pool)
+### 2. Central Pool
 
-**단일 진실 소스**. 모든 소스 플러그인이 이 배열에 추가하고, HTTP 프록시는 여기서만 선택한다.
+**Single source of truth.** All source plugins write into this array;
+the HTTP proxy always selects from it.
 
 ```go
 type Entry struct {
     Addr         string             // "host:port"
-    Source       string             // 어느 플러그인이 추가했는지 (관측용)
+    Source       string             // which plugin added it (for observability)
     Auth         *Auth              // SOCKS5 user/pass (optional)
-    EwmaLatency  time.Duration      // 지수가중평균 지연시간
-    SuccessRate  float64            // 최근 윈도우 성공률
-    ConsecFails  int                // 연속 실패 횟수 (격리 판단)
-    Inflight     int32              // 현재 처리 중 요청 수 (P2C 선택)
-    LastOk       time.Time          // 최근 성공 시점
-    Metadata     map[string]string  // country, tier 등 확장용
+    EwmaLatency  time.Duration      // exponentially weighted moving avg latency
+    SuccessRate  float64            // recent-window success rate
+    ConsecFails  int                // consecutive failures (drives quarantine)
+    Inflight     int32              // in-flight requests (for P2C)
+    LastOk       time.Time          // last success timestamp
+    Metadata     map[string]string  // country, tier, etc. for future use
     State        State              // active | quarantine
 }
 ```
 
-**선택 전략**: Power-of-Two-Choices — 랜덤 2개 뽑아 `Inflight` 낮은 쪽. 단일 프록시에 요청 집중 방지.
+**Selection strategy**: power-of-two-choices — pick two entries at
+random, send the request to the one with lower `Inflight`. Avoids
+concentrating load on a single proxy.
 
-**격리**: `ConsecFails ≥ EJECT_CONSEC_FAILS`이면 `quarantine` 상태로 전환, `QUARANTINE_DURATION` 후 검증기로 재시도.
+**Quarantine**: once `ConsecFails ≥ EJECT_CONSEC_FAILS`, the entry
+transitions to `quarantine` and is revalidated after
+`QUARANTINE_DURATION`.
 
-**중복 처리**: 여러 소스가 동일 `Addr`를 추가하면 무시 (먼저 등록된 엔트리 유지, `Source` 필드는 첫 등록자).
+**Deduplication**: if multiple sources add the same `Addr`, the later
+adds are ignored. The first registrant keeps the `Source` field.
 
-### 3. 소스 플러그인
+### 3. Source plugins
 
-각 소스는 독립 goroutine으로 실행되며 자기 수집 주기와 백오프 전략을 가진다. 공통 `Validator`를 주입받아 검증 후 풀에 추가한다.
+Each source runs in its own goroutine with its own fetch cadence and
+backoff. It receives the shared `Validator` by dependency injection
+and writes validated entries into the pool.
 
-#### 인터페이스
+#### Interface
 
 ```go
 type Source interface {
@@ -126,7 +140,7 @@ type Source interface {
 }
 
 type Validator interface {
-    // 프록시가 TEST_URL에 정상 응답하면 nil, 아니면 error
+    // Nil if the proxy correctly responds to TEST_URL; error otherwise.
     Validate(ctx context.Context, proxy RawProxy) error
 }
 
@@ -137,7 +151,7 @@ type RawProxy struct {
 }
 ```
 
-#### 표준 동작 패턴
+#### Canonical pattern
 
 ```go
 func (s *MySource) Run(ctx context.Context, pool *Pool, v Validator) error {
@@ -147,8 +161,8 @@ func (s *MySource) Run(ctx context.Context, pool *Pool, v Validator) error {
         case <-ctx.Done(): return nil
         case <-tick.C:
         }
-        raws, err := s.fetch(ctx)          // 소스별 수집 로직
-        if err != nil { continue }         // 자체 로깅/백오프
+        raws, err := s.fetch(ctx)          // source-specific fetch
+        if err != nil { continue }         // log/backoff internally
         for _, r := range raws {
             if err := v.Validate(ctx, r); err != nil { continue }
             pool.Add(Entry{Addr: r.Addr, Source: s.Name(), ...})
@@ -157,46 +171,52 @@ func (s *MySource) Run(ctx context.Context, pool *Pool, v Validator) error {
 }
 ```
 
-**핵심 원칙**:
-- 플러그인은 자기 수집 주기·에러 처리·재시도 정책에 대해 자율적
-- 검증은 공통 Validator에 위임 (일관된 품질 기준)
-- 풀에 추가만 하고 제거는 안 한다. 제거는 RequestTracker(실사용 피드백)와 Pool의 격리 로직이 담당
+**Key principles**:
+- Plugins are autonomous over their own cadence, error handling, and
+  retry policy
+- Validation is delegated to the shared `Validator` for a consistent
+  quality bar
+- Plugins only add to the pool; removal is handled by the
+  RequestTracker (live feedback) and the quarantine logic
 
-#### 초기 제공 플러그인
+#### Built-in plugins
 
-| 이름 | 설명 |
-|------|------|
-| `freeproxy` | iplocate/free-proxy-list의 socks5.txt 크롤 |
-| `file` | `/etc/proxy-rotator/proxies.txt` 정적 목록 (테스트/수동 관리용) |
+| Name | Description |
+|------|-------------|
+| `freeproxy` | Fetches `socks5.txt` from a public proxy list (TheSpeedX/PROXY-List by default) |
+| `file` | Reads a static list from `/etc/proxy-rotator/proxies.txt` (testing / manual override) |
 
-새 소스는 `internal/sources/*`에 파일 추가 + `cmd/main.go`에서 `sources.Register()` 한 줄로 등록.
+A new source is one file under `internal/sources/<name>/` plus a
+single `sources.Register()` call in `cmd/main.go`.
 
-### 4. Validator (공통)
+### 4. Validator (shared)
 
-| 항목 | 내용 |
-|------|------|
-| 검증 방식 | SOCKS5 프록시 경유로 `TEST_URL` 요청, HTTP 200 확인 |
-| 타임아웃 | `TEST_TIMEOUT` (기본 8초) |
-| 동시성 | Source가 자체 goroutine pool로 호출 (Validator는 호출 단위) |
+| Item | Details |
+|------|---------|
+| Check | GET `TEST_URL` through the candidate SOCKS5; accept HTTP 200 |
+| Timeout | `TEST_TIMEOUT` (default 8s) |
+| Concurrency | Sources run their own goroutine pool; the validator is per-call stateless |
 
-### 5. RequestTracker (피드백 루프)
+### 5. RequestTracker (feedback loop)
 
-HTTP 프록시 핸들러가 매 요청 결과를 Pool에 반영한다.
+The HTTP proxy handler reflects every request outcome back into the
+pool.
 
 ```
-성공: EwmaLatency 업데이트, ConsecFails=0, LastOk=now
-실패: ConsecFails++, 임계 초과 시 Pool.Quarantine()
+success: update EwmaLatency, ConsecFails=0, LastOk=now
+failure: ConsecFails++, quarantine if over threshold
 ```
 
-배치 검증이 놓치는 "지금 이 순간 죽은 프록시"를 실시간으로 반영한다.
+Catches proxies that pass periodic validation but die during real use
+— something a purely periodic approach misses.
 
-## 라우팅 규칙
+## Routing rules
 
-프록시 경유 대상 결정은 **3개 레이어에서 지원**. 환경에 맞게 하나 또는 조합해 사용.
+Three layers are supported. Pick one or combine them.
 
-### Layer A: 앱 환경변수 (가장 일반적)
+### Layer A: app env vars (most common)
 
-런타임 종류와 무관하게 동작. 언어별 HTTP 클라이언트가 표준적으로 지원.
+Runtime-agnostic; every language's HTTP client respects these.
 
 ```
 HTTP_PROXY=http://localhost:3128
@@ -204,19 +224,20 @@ HTTPS_PROXY=http://localhost:3128
 NO_PROXY=.cluster.local,.svc,localhost,127.0.0.1
 ```
 
-### Layer B: proxy-rotator 내부 매치 규칙
+### Layer B: proxy-rotator's own match rules
 
-앱은 모든 트래픽을 프록시로 보내고, proxy-rotator가 host 기반으로 선별.
+Apps send everything to the proxy; the rotator filters per-host.
 
 ```
-MATCH_HOSTS=target-site.com,*.another.com   # 매칭 시 SOCKS5 경유
-BYPASS_HOSTS=.cluster.local,.internal       # 직접 접속
+MATCH_HOSTS=target-site.com,*.another.com   # these go through SOCKS5
+BYPASS_HOSTS=.cluster.local,.internal       # these go direct
 DEFAULT_ACTION=direct                       # reject | direct | proxy
 ```
 
-### Layer C: Istio VirtualService (Istio 사용자만)
+### Layer C: Istio VirtualService (Istio users only)
 
-앱 코드/환경변수 완전 무변경. Layer A/B와 달리 sidecar 투명 라우팅.
+No app-side env vars. Istio transparently routes selected hosts to the
+rotator.
 
 ```yaml
 apiVersion: networking.istio.io/v1beta1
@@ -240,56 +261,60 @@ spec:
         port: {number: 3128}
 ```
 
-세 레이어 모두 동작 가능하도록 proxy-rotator는 "받은 모든 요청을 지정된 규칙에 따라 처리"하는 단순 모델로 설계.
+Because all three layers must work with the same image, the rotator
+stays simple: "handle any request I receive according to the
+configured rules."
 
-## 환경변수
+## Environment variables
 
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `LISTEN_PORT` | `3128` | HTTP 프록시 포트 |
-| `ADMIN_PORT` | `8080` | `/healthz`, `/metrics`, `/pool` |
-| `TEST_URL` | `https://example.com` | 검증용 요청 대상 (실 타겟 URL 권장) |
-| `TEST_TIMEOUT` | `8s` | 검증 타임아웃 |
-| `PER_PROXY_TIMEOUT` | `8s` | 실 요청 업스트림 타임아웃 |
-| `TOTAL_TIMEOUT` | `30s` | 재시도 포함 총 타임아웃 |
-| `MAX_RETRIES` | `2` | 멱등 요청 재시도 횟수 |
-| `POOL_MIN` | `5` | 이하로 떨어지면 소스 플러그인이 가속 주기로 전환하라는 신호 |
-| `POOL_MAX` | `50` | 풀 상한 |
-| `EJECT_CONSEC_FAILS` | `3` | 격리 임계값 |
-| `QUARANTINE_DURATION` | `5m` | 격리 후 재검증까지 대기 |
-| `MATCH_HOSTS` | (비어있음) | 프록시 경유 host 패턴 (콤마 구분) |
-| `BYPASS_HOSTS` | `.cluster.local,.svc,localhost` | 직접 접속 host |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LISTEN_PORT` | `3128` | HTTP proxy port |
+| `ADMIN_PORT` | `8080` | `/livez`, `/readyz`, `/startupz`, `/healthz`, `/metrics`, `/pool` |
+| `TEST_URL` | `https://example.com` | Validation target (set to a neutral endpoint — see Constraints) |
+| `TEST_TIMEOUT` | `8s` | Validation timeout |
+| `PER_PROXY_TIMEOUT` | `8s` | Per-attempt upstream timeout |
+| `TOTAL_TIMEOUT` | `30s` | Total budget including retries |
+| `MAX_RETRIES` | `2` | Retry count for idempotent methods |
+| `POOL_MIN` | `5` | Below this, source plugins may switch to accelerated fetch |
+| `POOL_MAX` | `50` | Upper pool bound |
+| `EJECT_CONSEC_FAILS` | `3` | Quarantine threshold |
+| `QUARANTINE_DURATION` | `5m` | Wait before revalidation |
+| `MATCH_HOSTS` | (empty) | Host patterns routed via SOCKS5 (comma separated) |
+| `BYPASS_HOSTS` | `.cluster.local,.svc,localhost` | Host patterns dialed directly |
 | `DEFAULT_ACTION` | `proxy` | `proxy` \| `direct` \| `reject` |
-| `SOURCES` | `freeproxy` | 활성화 소스 (콤마 구분) |
-| `SOURCE_FREEPROXY_URL` | TheSpeedX/PROXY-List socks5.txt | freeproxy 플러그인 소스 URL |
-| `SOURCE_FREEPROXY_INTERVAL` | `10m` | 평시 수집 주기 |
-| `SOURCE_FREEPROXY_INTERVAL_LOW` | `30s` | `POOL_MIN` 이하일 때의 수집 주기 |
-| `SOURCE_FREEPROXY_CONCURRENCY` | `20` | 검증 동시성 |
-| `SOURCE_FREEPROXY_HTTP_TIMEOUT` | `30s` | 소스 HTTP GET 타임아웃 |
-| `SOURCE_FILE_PATH` | `/etc/proxy-rotator/proxies.txt` | file 플러그인 경로 |
-| `SOURCE_FILE_INTERVAL` | `60s` | file 플러그인 재스캔 주기 |
-| `SOURCE_FILE_CONCURRENCY` | `10` | file 플러그인 검증 동시성 |
+| `SOURCES` | `freeproxy` | Enabled source plugins (comma separated) |
+| `SOURCE_FREEPROXY_URL` | TheSpeedX/PROXY-List socks5.txt | Upstream URL for `freeproxy` |
+| `SOURCE_FREEPROXY_INTERVAL` | `10m` | Steady fetch interval |
+| `SOURCE_FREEPROXY_INTERVAL_LOW` | `30s` | Accelerated interval when `POOL_MIN` is not met |
+| `SOURCE_FREEPROXY_CONCURRENCY` | `20` | Parallel validations |
+| `SOURCE_FREEPROXY_HTTP_TIMEOUT` | `30s` | HTTP GET timeout for the source fetch |
+| `SOURCE_FILE_PATH` | `/etc/proxy-rotator/proxies.txt` | Path for the `file` plugin |
+| `SOURCE_FILE_INTERVAL` | `60s` | Rescan interval for the `file` plugin |
+| `SOURCE_FILE_CONCURRENCY` | `10` | Parallel validations for the `file` plugin |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 
-## 배포 시나리오
+## Deployment scenarios
 
-### 1. Docker 단독
+### 1. Docker standalone
 
 ```bash
 docker run --rm -p 3128:3128 -p 8080:8080 \
-  -e TEST_URL=https://example.com \
+  -e TEST_URL=https://www.cloudflare.com/cdn-cgi/trace \
   -e SOURCES=freeproxy \
   jadewon/proxy-rotator:latest
 ```
 
-앱에서 `HTTP_PROXY=http://host.docker.internal:3128` (또는 Compose 네트워크의 서비스명).
+Apps on the host set `HTTP_PROXY=http://host.docker.internal:3128` (or
+the corresponding Compose service name).
 
-### 2. K8s Plain (Istio 없음)
+### 2. Kubernetes without Istio
 
-`deploy/examples/deployment.yaml` 사용. 독립 `Deployment + Service`로 배포하고 클러스터 내 여러 워크로드가 공유 사용.
+Use `deploy/examples/deployment.yaml`. Deploy as a standalone
+`Deployment + Service` shared across workloads in the cluster:
 
 ```yaml
-# 클라이언트 Deployment
+# client Deployment
 env:
   - name: HTTP_PROXY
     value: "http://proxy-rotator.default.svc:3128"
@@ -299,131 +324,155 @@ env:
     value: ".cluster.local,.svc,localhost"
 ```
 
-또는 `deploy/examples/sidecar.yaml`을 Deployment의 `containers`에 병합하여 파드당 사이드카 모델로.
+Alternatively merge `deploy/examples/sidecar.yaml` into a Deployment's
+`containers` list for the per-pod sidecar model.
 
-### 3. K8s + Istio (옵션)
+### 3. Kubernetes + Istio (optional)
 
-`deploy/examples/istio.yaml`의 `ServiceEntry` + `VirtualService`를 추가하면 앱 환경변수 없이 투명 라우팅. 위 2번과 독립 선택 가능.
+Apply `deploy/examples/istio.yaml` (`ServiceEntry` + `VirtualService`)
+to route selected hosts through the rotator without any app-side
+config. Independent of, and compatible with, pattern 2.
 
-## 헬스체크
+## Probes
 
-| 엔드포인트 | 응답 기준 |
-|-----------|-----------|
-| `GET /healthz` | 풀 크기 ≥ 1이면 200, 아니면 503 |
-| `GET /metrics` | Prometheus 포맷 |
-| `GET /pool` | 현재 풀 상태 JSON (디버그용) |
+| Endpoint | Kubernetes probe | Returns |
+|----------|------------------|---------|
+| `GET /livez` | livenessProbe | Always 200 while the server is running |
+| `GET /readyz` | readinessProbe | 200 if pool has ≥1 active entry, 503 otherwise |
+| `GET /startupz` | startupProbe | 200 once the first proxy arrives or `STARTUP_GRACE` elapses |
+| `GET /healthz` | (legacy alias for `/readyz`) | |
+| `GET /pool` | debug | JSON snapshot of the pool |
+| `GET /metrics` | Prometheus | — |
 
-## 관측
+## Observability
 
-**메트릭 (Prometheus)**:
+**Prometheus metrics**:
 - `proxy_pool_size{state="active|quarantine"}`
 - `proxy_pool_source_size{source="freeproxy|file|..."}`
-- `proxy_request_total{result="success|fail|retry"}`
+- `proxy_request_total{result="success|fail|rejected|direct"}`
 - `proxy_request_duration_seconds` (histogram)
-- `proxy_upstream_total{proxy="host:port", result="success|fail"}`
+- `proxy_upstream_total{result="success|fail"}`
 - `proxy_verify_total{source, result}`
 
-**트레이싱**: Istio 환경에선 Envoy가 W3C Trace Context를 자동 전파. 메쉬 없는 환경에서는 필요 시 `otelhttp` 미들웨어로 수동 계측 (초기 버전 미포함).
+**Tracing**: Under Istio, Envoy propagates W3C Trace Context
+automatically. Without a mesh, add an `otelhttp` middleware if
+tracing is needed (not shipped in the initial release).
 
-## 프로젝트 구조
+## Project layout
 
 ```
 proxy-rotator/
 ├── PRD.md
+├── README.md
+├── LICENSE
 ├── go.mod / go.sum
-├── cmd/proxy-rotator/main.go          # 소스 등록, 의존성 와이어링
+├── cmd/proxy-rotator/main.go          # source registration + dependency wiring
 ├── internal/
 │   ├── pool/
-│   │   ├── pool.go                    # 중앙 풀, 선택 전략
+│   │   ├── pool.go                    # central pool, selection strategy
 │   │   └── entry.go
 │   ├── proxy/
-│   │   └── handler.go                 # HTTP CONNECT + forward, 재시도
+│   │   └── handler.go                 # HTTP CONNECT / forward, retries
 │   ├── validator/
-│   │   └── validator.go               # TEST_URL 검증
-│   ├── tracker/
-│   │   └── tracker.go                 # 요청 결과 피드백
+│   │   └── validator.go               # TEST_URL validation
 │   ├── router/
-│   │   └── router.go                  # MATCH/BYPASS/DEFAULT 규칙
+│   │   └── router.go                  # MATCH / BYPASS / DEFAULT rules
+│   ├── auth/
+│   │   └── auth.go                    # Proxy-Authorization handling
+│   ├── guard/
+│   │   └── guard.go                   # SSRF / DNS-rebinding guard
 │   ├── sources/
-│   │   ├── source.go                  # Source 인터페이스
+│   │   ├── source.go                  # Source interface
 │   │   ├── freeproxy/freeproxy.go
 │   │   └── file/file.go
-│   └── metrics/metrics.go
+│   ├── metrics/metrics.go
+│   └── envutil/envutil.go
+├── docs/
+│   ├── deployment/                    # railway / k8s-sidecar / egress-restricted / hosting-options
+│   └── references.md
 ├── deploy/
-│   ├── Dockerfile                     # 멀티스테이지, distroless
-│   └── examples/                      # deployment / sidecar / Istio 예시
-├── README.md
-└── LICENSE
+│   ├── Dockerfile                     # multi-stage, distroless
+│   └── examples/                      # deployment / sidecar / Istio / NetworkPolicy
+└── .github/workflows/                 # CI + Release
 ```
 
-## 마일스톤
+## Milestones
 
-| 단계 | 내용 |
-|------|------|
-| M1 | Pool + HTTP 프록시 + `file` 소스로 로컬 동작 (Docker) |
-| M2 | `freeproxy` 소스 + Validator + RequestTracker + 격리/재시도 |
-| M3 | 메트릭 + 배포 예시(Docker/K8s/Istio) |
-| M4 | README + 공개 리포 배포 (OSS) |
-| M5 | 실제 서비스 통합/운영 |
+| Stage | Content |
+|-------|---------|
+| M1 | Pool + HTTP proxy + `file` source running locally (Docker) |
+| M2 | `freeproxy` source + validator + RequestTracker + quarantine/retry |
+| M3 | Metrics + deployment examples (Docker / K8s / Istio) |
+| M4 | README + public OSS release |
+| M5 | Integration into real services / production operation |
 
-## 제약사항
+## Constraints
 
-- 무료 프록시 의존 시 가용성/품질 불안정 → 투명 재시도 + 실시간 피드백으로 완화하되 완전 해결은 불가
-- SOCKS5 공개 프록시는 인증 미지원이 일반적 (`Auth` 필드는 유료 소스 확장용)
-- 인스턴스별 독립 풀 전제 (여러 레플리카 간 공유 없음)
-- **443-only egress 환경에서는 proxy-rotator를 해당 네트워크 내부에서
-  실행할 수 없다** — SOCKS5 다이얼이 비표준 포트(1080/4145/9050 등)를
-  요구하므로, serving 컴포넌트는 반드시 egress 자유로운 환경에
-  배치해야 한다. 자세한 내용은 `docs/deployment/egress-restricted.md`
-- **`TEST_URL`은 실제 크롤링 타겟으로 지정하면 안 된다** — 매 사이클마다
-  모든 후보 프록시가 동시에 호출하여 타겟 입장에선 분산 공격 패턴으로
-  보이고, 오히려 차단을 강화시킨다. 중립적 엔드포인트
-  (`https://www.cloudflare.com/cdn-cgi/trace` 등) 사용. 실사용 성공/실패는
-  RequestTracker가 자동 반영한다.
+- Free public proxy reliability is inherently noisy. Transparent
+  retries plus real-time feedback soften this but cannot eliminate it.
+- Public SOCKS5 proxies usually don't support authentication. The
+  `Auth` field exists for future paid-source extensions.
+- The pool is per-instance and in-memory; replicas do not share state.
+- **proxy-rotator cannot run inside a network segment whose egress is
+  restricted to 443.** SOCKS5 dials require arbitrary high ports
+  (1080, 4145, 9050, …), so the serving component must live where
+  outbound is unrestricted. See
+  `docs/deployment/egress-restricted.md`.
+- **`TEST_URL` must not be pointed at the site you actually want to
+  crawl.** Every candidate in every fetch cycle hits this URL, so a
+  full cycle looks like a distributed attack coming from thousands of
+  IPs — which hardens the target's blocking instead of working around
+  it. Use a neutral endpoint (e.g.
+  `https://www.cloudflare.com/cdn-cgi/trace`); RequestTracker takes
+  care of pruning proxies that actually fail against the real target
+  during live usage.
 
-## 미래 요구사항 (낮은 우선순위)
+## Future requirements (low priority)
 
-초기 구현에 포함하지 않지만, **인터페이스 설계 시 확장 여지를 남겨둘** 항목들.
+Not in the initial implementation, but **interface stubs and extension
+points are preserved** for these.
 
-### 라우팅/선택
-- Geographic 라우팅 (국가별 프록시 선택) — `Entry.Metadata["country"]` 필드로 스텁만
-- Sticky session (쿠키/헤더 해시 기반 동일 프록시 재선택)
-- 타겟별 전용 풀 (named pool 분리)
-- 우선순위 티어 (유료 프록시 우선 사용) — `Entry.Metadata["tier"]` 스텁만
+### Routing / selection
+- Geographic routing (select by country) — `Entry.Metadata["country"]` stub
+- Sticky sessions (same cookie/header hash → same proxy)
+- Named pools per target
+- Priority tiers (prefer paid proxies) — `Entry.Metadata["tier"]` stub
 
-### 프록시 소스
-- 유료 프록시 API 플러그인 (Bright Data, Smartproxy 등)
-- 자체 소유 프록시 플러그인 (고정 고품질)
-- SOCKS5 인증 (username/password)
-- SOCKS4 / HTTP 프록시 백엔드 수용
-- **`SKIP_VALIDATION` 옵션** (소스 단위) — 외부에서 이미 검증된 풀을
-  pull만 하는 deployment(예: collector/server 분리)에서 중복 검증 생략
-- **`pool-mirror` 소스 플러그인** — 다른 proxy-rotator 인스턴스의 `/pool`
-  JSON을 mirror. 이 조합으로 "외부 검증 노드 + 내부 서빙 노드" 아키텍처
-  공식 지원
+### Proxy sources
+- Paid proxy API plugins (Bright Data, Smartproxy, …)
+- Privately owned proxy plugins (known-good upstreams)
+- SOCKS5 authentication (username/password)
+- SOCKS4 / HTTP-proxy backends
+- **`SKIP_VALIDATION` option** (per source) — skip redundant validation
+  when a deployment only pulls an already-validated list (e.g. in a
+  collector/server split)
+- **`pool-mirror` source plugin** — mirrors another proxy-rotator
+  instance's `/pool` JSON. Combined with `SKIP_VALIDATION`, this
+  officially supports the "external validation node + internal
+  serving node" architecture
 
-### 품질/제어
-- 응답 내용 검증 (CAPTCHA/차단 페이지 패턴 감지)
-- 프록시당 rate limit (token bucket)
-- 타겟 사이트별 circuit breaker
-- Warm start (재시작 시 이전 풀 복원, 디스크 캐시)
-- 응답시간 기반 가중 선택
+### Quality / control
+- Content-based validation (detect CAPTCHA / block pages)
+- Per-proxy rate limiting (token bucket)
+- Per-target circuit breaker
+- Warm start (persist the pool to disk; restore on restart)
+- Weighted selection by response time
 
-### 관측
-- Admin API (수동 ban/추가)
-- ConfigMap hot-reload (재시작 없이 환경변수 반영)
+### Observability
+- Admin API (manual ban / add)
+- ConfigMap hot-reload (pick up env-var changes without restart)
 
-### 보안
-- 호스트 allowlist (오남용 방지)
-- 자체 인증 (Basic/mTLS) — 여러 namespace 공유 시 필요
-- User-Agent 로테이션/헤더 주입
+### Security
+- Host allowlist (prevent abuse)
+- Proxy-level auth (Basic / mTLS) for multi-tenant deployments
+- User-Agent rotation / header injection
 
-### 배포/스케일
-- DaemonSet 모드 (노드 단위 공유)
-- 레플리카 간 풀 공유 (Redis 백엔드)
-- HPA (풀 고갈률 기반)
+### Deployment / scale
+- DaemonSet mode (per-node sharing)
+- Pool sharing across replicas (Redis backend)
+- HPA driven by pool-depletion rate
 
-### 프로토콜
+### Protocols
 - HTTP/2 upstream
-- SOCKS5 remote DNS (업스트림에서 DNS 해석)
+- SOCKS5 remote DNS (resolve at the upstream)
 - HTTP/3 (QUIC)
